@@ -27,6 +27,39 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+__global__ void upsweep(int* arr, int two_d) {
+    int threadId = blockIdx.x * blockDim.x + threadIdx.x;
+    int two_dplus1 = two_d * 2;
+    int i = threadId * two_dplus1;
+    arr[i + two_dplus1 - 1] += arr[i + two_d - 1];
+}
+
+__global__ void downsweep(int* arr, int two_d) {
+    int threadId = blockIdx.x * blockDim.x + threadIdx.x;
+    int two_dplus1 = two_d * 2;
+    int i = threadId * two_dplus1;
+
+    int tmp = arr[i + two_d - 1];
+    arr[i + two_d - 1] = arr[i + two_dplus1 - 1];
+    arr[i + two_dplus1 - 1] += tmp;
+}
+
+__global__ void setVal(int* ptr, int val) {
+    *ptr = val;
+}
+
+// 计算launch kernal时block及每个block内thread数量
+// 假定N为2的幂
+inline std::pair<int, int> calGridBlock(int N, int two_d) {
+    const int threads_per_block = 512;
+    int two_dplus1 = two_d * 2;
+    int total_threads = N / two_dplus1;
+    if (total_threads < threads_per_block)
+        return {1, total_threads};
+    int blocks = total_threads / threads_per_block;
+    return {blocks, threads_per_block};
+}
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -45,7 +78,7 @@ static inline int nextPow2(int n) {
 void exclusive_scan(int* input, int N, int* result)
 {
 
-    // CS149 TODO:
+    // CS149 Done:
     //
     // Implement your exclusive scan implementation here.  Keep in
     // mind that although the arguments to this function are device
@@ -54,7 +87,24 @@ void exclusive_scan(int* input, int N, int* result)
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
 
+    N = nextPow2(N);
 
+    // upsweep阶段
+    for (int two_d = 1; two_d <= N / 2; two_d *= 2) {
+        auto [blocks, thread_per_block] = calGridBlock(N, two_d);
+        upsweep<<<blocks, thread_per_block>>>(result, two_d);
+        cudaDeviceSynchronize();
+    }
+
+    setVal<<<1, 1>>>(result + N - 1, 0);
+    cudaDeviceSynchronize();
+
+    // downsweep阶段
+    for (int two_d = N / 2; two_d >= 1; two_d /= 2) {
+        auto [blocks, thread_per_block] = calGridBlock(N, two_d);
+        downsweep<<<blocks, thread_per_block>>>(result, two_d);
+        cudaDeviceSynchronize();
+    }
 }
 
 
@@ -140,6 +190,17 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration; 
 }
 
+__global__ void compare(int* input, int N, int* output) {
+    int threadId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (threadId < N - 1)
+      output[threadId] = input[threadId] == input[threadId + 1];
+}
+
+__global__ void fill_repeats_result(int N, int* flag, int* idx, int* output) {
+    int threadId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (threadId < N - 1 && flag[threadId])
+        output[idx[threadId]] = threadId;
+}
 
 // find_repeats --
 //
@@ -149,7 +210,7 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 // Returns the total number of pairs found
 int find_repeats(int* device_input, int length, int* device_output) {
 
-    // CS149 TODO:
+    // CS149 Done:
     //
     // Implement this function. You will probably want to
     // make use of one or more calls to exclusive_scan(), as well as
@@ -161,7 +222,34 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
 
-    return 0; 
+    int rounded_length = nextPow2(length);
+
+    int* device_flags;  // 记录device_input[i] == device_input[i + 1]
+    int* device_idx;
+    cudaMalloc((void **)&device_flags, rounded_length * sizeof(int));
+    cudaMalloc((void **)&device_idx, rounded_length * sizeof(int));
+
+    int threads_per_block = 512;
+    int blocks = (length + threads_per_block - 1) / threads_per_block;
+    // GPU并行计算数组元素是否满足device_input[i] == device_input[i + 1]
+    compare<<<blocks, threads_per_block>>>(device_input, length, device_flags);
+    cudaDeviceSynchronize();
+
+    // 求device_flags的exclusive presum，
+    // flag[i] == 1处对应的device_idx[i]是i在device_output中的索引
+    cudaMemcpy(device_idx, device_flags, length * sizeof(int), cudaMemcpyDeviceToDevice);
+    exclusive_scan(device_flags, length, device_idx);
+    cudaDeviceSynchronize();
+
+    fill_repeats_result<<<blocks, threads_per_block>>>(length, device_flags, device_idx, device_output);
+
+    // 所有repeats的数量为device_idx最后元素的值
+    int ret;
+    cudaMemcpy(&ret, device_idx + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+
+    cudaFree(device_flags);
+    cudaFree(device_idx);
+    return ret;
 }
 
 

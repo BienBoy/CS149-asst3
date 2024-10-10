@@ -55,6 +55,11 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 // file simpler and to seperate code that should not be modified
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
+#include "circleBoxTest.cu_inl"
+#define BLOCKDIM 32
+#define BLOCKSIZE (BLOCKDIM * BLOCKDIM)
+#define SCAN_BLOCK_DIM BLOCKSIZE
+#include "exclusiveScan.cu_inl"
 
 
 // kernelClearImageSnowflake -- (CUDA device code)
@@ -106,7 +111,7 @@ __global__ void kernelClearImage(float r, float g, float b, float a) {
 }
 
 // kernelAdvanceFireWorks
-// 
+//
 // Update the position of the fireworks (if circle is firework)
 __global__ void kernelAdvanceFireWorks() {
     const float dt = 1.f / 60.f;
@@ -121,7 +126,7 @@ __global__ void kernelAdvanceFireWorks() {
     if (index >= cuConstRendererParams.numCircles)
         return;
 
-    if (0 <= index && index < NUM_FIREWORKS) { // firework center; no update 
+    if (0 <= index && index < NUM_FIREWORKS) { // firework center; no update
         return;
     }
 
@@ -148,9 +153,9 @@ __global__ void kernelAdvanceFireWorks() {
     float cxsx = sx - cx;
     float cysy = sy - cy;
 
-    // compute distance from fire-work 
+    // compute distance from fire-work
     float dist = sqrt(cxsx * cxsx + cysy * cysy);
-    if (dist > maxDist) { // restore to starting position 
+    if (dist > maxDist) { // restore to starting position
         // random starting position on fire-work's rim
         float angle = (sfIdx * 2 * pi)/NUM_SPARKS;
         float sinA = sin(angle);
@@ -162,60 +167,60 @@ __global__ void kernelAdvanceFireWorks() {
         position[index3j+1] = position[index3i+1] + y;
         position[index3j+2] = 0.0f;
 
-        // travel scaled unit length 
+        // travel scaled unit length
         velocity[index3j] = cosA/5.0;
         velocity[index3j+1] = sinA/5.0;
         velocity[index3j+2] = 0.0f;
     }
 }
 
-// kernelAdvanceHypnosis   
+// kernelAdvanceHypnosis
 //
 // Update the radius/color of the circles
-__global__ void kernelAdvanceHypnosis() { 
+__global__ void kernelAdvanceHypnosis() {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= cuConstRendererParams.numCircles) 
-        return; 
+    if (index >= cuConstRendererParams.numCircles)
+        return;
 
-    float* radius = cuConstRendererParams.radius; 
+    float* radius = cuConstRendererParams.radius;
 
     float cutOff = 0.5f;
-    // place circle back in center after reaching threshold radisus 
-    if (radius[index] > cutOff) { 
-        radius[index] = 0.02f; 
-    } else { 
-        radius[index] += 0.01f; 
-    }   
-}   
+    // place circle back in center after reaching threshold radisus
+    if (radius[index] > cutOff) {
+        radius[index] = 0.02f;
+    } else {
+        radius[index] += 0.01f;
+    }
+}
 
 
 // kernelAdvanceBouncingBalls
-// 
+//
 // Update the positino of the balls
-__global__ void kernelAdvanceBouncingBalls() { 
+__global__ void kernelAdvanceBouncingBalls() {
     const float dt = 1.f / 60.f;
     const float kGravity = -2.8f; // sorry Newton
     const float kDragCoeff = -0.8f;
     const float epsilon = 0.001f;
 
-    int index = blockIdx.x * blockDim.x + threadIdx.x; 
-   
-    if (index >= cuConstRendererParams.numCircles) 
-        return; 
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    float* velocity = cuConstRendererParams.velocity; 
-    float* position = cuConstRendererParams.position; 
+    if (index >= cuConstRendererParams.numCircles)
+        return;
+
+    float* velocity = cuConstRendererParams.velocity;
+    float* position = cuConstRendererParams.position;
 
     int index3 = 3 * index;
     // reverse velocity if center position < 0
     float oldVelocity = velocity[index3+1];
     float oldPosition = position[index3+1];
 
-    if (oldVelocity == 0.f && oldPosition == 0.f) { // stop-condition 
+    if (oldVelocity == 0.f && oldPosition == 0.f) { // stop-condition
         return;
     }
 
-    if (position[index3+1] < 0 && oldVelocity < 0.f) { // bounce ball 
+    if (position[index3+1] < 0 && oldVelocity < 0.f) { // bounce ball
         velocity[index3+1] *= kDragCoeff;
     }
 
@@ -227,7 +232,7 @@ __global__ void kernelAdvanceBouncingBalls() {
 
     if (fabsf(velocity[index3+1] - oldVelocity) < epsilon
         && oldPosition < 0.0f
-        && fabsf(position[index3+1]-oldPosition) < epsilon) { // stop ball 
+        && fabsf(position[index3+1]-oldPosition) < epsilon) { // stop ball
         velocity[index3+1] = 0.f;
         position[index3+1] = 0.f;
     }
@@ -427,6 +432,74 @@ __global__ void kernelRenderCircles() {
     }
 }
 
+// kernelRenderPixels -- (CUDA device code)
+//
+// Each thread renders a pixel.
+__global__ void kernelRenderPixels() {
+    uint idx = blockDim.x * threadIdx.y + threadIdx.x;
+    uint pixelX = blockDim.x * blockIdx.x + threadIdx.x;
+    uint pixelY = blockDim.y * blockIdx.y + threadIdx.y;
+    short imageWidth = (short)cuConstRendererParams.imageWidth;
+    short imageHeight = (short)cuConstRendererParams.imageHeight;
+
+    float invWidth = 1.f / (float)imageWidth;
+    float invHeight = 1.f / (float)imageHeight;
+
+    // 线程块负责的矩形区域
+    uint boxL = blockDim.x * blockIdx.x;
+    uint boxR = boxL + blockDim.x < imageWidth ? boxL + blockDim.x : imageWidth;
+    uint boxB = blockDim.y * blockIdx.y;
+    uint boxT = boxB + blockDim.y < imageHeight ? boxB + blockDim.y : imageHeight;
+
+    float boxLNorm = (float)boxL * invWidth;
+    float boxRNorm = (float)boxR * invWidth;
+    float boxBNorm = (float)boxB * invHeight;
+    float boxTNorm = (float)boxT * invHeight;
+
+    __shared__ uint flag[BLOCKSIZE];
+    __shared__ uint presum[BLOCKSIZE];
+    __shared__ uint scratch[BLOCKSIZE * 2];
+    __shared__ uint circles[BLOCKSIZE];
+
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+
+    int numCircles = cuConstRendererParams.numCircles;
+    for (int i = 0; i < numCircles; i += BLOCKSIZE) {
+        uint circleIdx = i + idx;
+        // 本线程负责检查的圆的序号
+        // 检查圆是否与该区域有交叉
+        if (circleIdx < numCircles) {
+            float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIdx]);
+            flag[idx] = circleInBox(p.x, p.y,
+                cuConstRendererParams.radius[circleIdx],
+                boxLNorm, boxRNorm, boxTNorm, boxBNorm);
+        } else {
+            flag[idx] = 0;
+        }
+        __syncthreads();
+
+        // 计算flag的前缀和
+        sharedMemExclusiveScan((int)idx, flag, presum, scratch, BLOCKSIZE);
+        __syncthreads();
+
+        // 获取所有可能和区域相交的圆
+        if (flag[idx])
+            circles[presum[idx]] = circleIdx;
+        __syncthreads();
+
+        // 进行渲染
+        if (pixelX < imageWidth && pixelY < imageHeight) {
+            uint num = presum[BLOCKSIZE - 1] + flag[BLOCKSIZE - 1]; // 可能和区域相交的圆的数量
+            for (int j = 0; j < num; ++j) {
+                float3 p = *(float3*)(&cuConstRendererParams.position[3 * circles[j]]);
+                shadePixel((int)circles[j], pixelCenterNorm, p, imgPtr);
+            }
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -512,7 +585,7 @@ CudaRenderer::setup() {
         printf("   CUDA Cap:   %d.%d\n", deviceProps.major, deviceProps.minor);
     }
     printf("---------------------------------------------------------\n");
-    
+
     // By this time the scene should be loaded.  Now copy all the key
     // data structures into device memory so they are accessible to
     // CUDA kernels
@@ -627,8 +700,8 @@ CudaRenderer::advanceAnimation() {
         kernelAdvanceBouncingBalls<<<gridDim, blockDim>>>();
     } else if (sceneName == HYPNOSIS) {
         kernelAdvanceHypnosis<<<gridDim, blockDim>>>();
-    } else if (sceneName == FIREWORKS) { 
-        kernelAdvanceFireWorks<<<gridDim, blockDim>>>(); 
+    } else if (sceneName == FIREWORKS) {
+        kernelAdvanceFireWorks<<<gridDim, blockDim>>>();
     }
     cudaDeviceSynchronize();
 }
@@ -637,9 +710,10 @@ void
 CudaRenderer::render() {
 
     // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    dim3 blockDim(BLOCKDIM, BLOCKDIM);
+    dim3 gridDim(
+        (image->width + blockDim.x - 1) / blockDim.x,
+        (image->height + blockDim.y - 1) / blockDim.y);
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+    kernelRenderPixels<<<gridDim, blockDim>>>();
 }
